@@ -1,0 +1,384 @@
+<!DOCTYPE html>
+<html lang="en" dir="ltr">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Image Analyzer</title>
+<style>
+  :root { --pad: 24px; }
+  body { font-family: Arial, sans-serif; background:#f7f7f7; margin:0; padding-top:72px; }
+  .topbar { position: fixed; top:12px; left:0; right:0; z-index: 10; display:flex; align-items:center; padding:0 var(--pad); }
+  .lang-switch { display:flex; gap:8px; width:100%; }
+  .lang-switch button { padding:8px 12px; border:none; border-radius:8px; cursor:pointer; background:#e9eefc; color:#0d47a1; }
+  .lang-switch button.active { background:#0d6efd; color:#fff; }
+  .lang-ar .lang-switch { justify-content:flex-start; }
+  .lang-en .lang-switch, .lang-de .lang-switch { justify-content:flex-end; }
+
+  .card { max-width:720px; margin:auto; background:#fff; padding:20px; border-radius:12px; box-shadow:0 4px 18px rgba(0,0,0,.08); }
+  h2 { margin:0 0 8px; }
+  .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin:8px 0; }
+  button.main { padding:10px 16px; border:none; border-radius:8px; cursor:pointer; background:#0d6efd; color:#fff; }
+  button.main:disabled { background:#9bb7ec; cursor:not-allowed; }
+  #img { width:100%; max-height:420px; object-fit:contain; display:none; border-radius:8px; border:1px solid #eee; }
+  .msg { display:none; margin-top:10px; padding:10px; border-radius:8px; }
+  .ok { background:#e7f7ed; color:#0b6b2e; }
+  .err { background:#fde7ea; color:#7d1120; }
+  .item { background:#f6f7fb; border-radius:8px; padding:8px 10px; margin:8px 0; }
+  .top { display:flex; justify-content:space-between; font-weight:600; }
+  .bar { height:6px; border-radius:4px; background:#0d6efd; margin-top:6px; }
+  .loader { display:none; border:4px solid #f3f3f3; border-top:4px solid #0d6efd; border-radius:50%; width:28px; height:28px; animation:spin 1s linear infinite;}
+  @keyframes spin{to{transform:rotate(360deg)}}
+</style>
+</head>
+<body class="lang-en">
+  <div class="topbar">
+    <div class="lang-switch" id="langSwitch">
+      <button data-lang="ar" >العربية</button>
+      <button data-lang="en" class="active">English</button>
+      <button data-lang="de">Deutsch</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2 id="title">Image Analyzer</h2>
+    <div class="row">
+      <input id="file" type="file" accept="image/png,image/jpeg" style="display:none"/>
+      <button id="pick" class="main">Choose Image</button>
+      <button id="analyze" class="main" disabled>Analyze</button>
+      <div id="loader" class="loader"></div>
+      <style>@keyframes spin{to{transform:rotate(360deg)}}</style>
+    </div>
+    <img id="img" alt="preview"/>
+    <div id="msg" class="msg"></div>
+    <div id="results"></div>
+  </div>
+
+<script>
+document.addEventListener('DOMContentLoaded', ()=>{
+   
+  const API_ENDPOINT = 'https:// Chang it to your/analyze';
+
+  
+  const MAX_SHOW = 5;
+
+  let file = null;
+  let lang = 'en';
+  let lastRawLabels = [];
+  let lastParentsOnly = [];
+
+ 
+  const CID = (() => {
+    try {
+      let v = localStorage.getItem('CID');
+      if (!v) {
+        v = (crypto?.randomUUID?.() || ('cid-' + Date.now() + '-' + Math.random().toString(36).slice(2)));
+        localStorage.setItem('CID', v);
+      }
+      return v;
+    } catch { return 'cid-fallback'; }
+  })();
+
+  const I18N = {
+    ar:{title:'محلل الصور',pick:'اختر صورة',analyze:'تحليل الصورة',loaded:'تم تحميل الصورة.',chooseFirst:'اختر صورة أولًا.',unsupported:'اختر JPEG أو PNG',tooLarge:(mb)=>`الحجم يتجاوز ${mb}MB`,noLabels:'لا توجد نتائج.',errorUnknown:'خطأ غير متوقع',rateExceeded:'تجاوزت الحد اليومي. جرّب غدًا.'},
+    en:{title:'Image Analyzer',pick:'Choose Image',analyze:'Analyze',loaded:'Image loaded.',chooseFirst:'Please choose an image first.',unsupported:'Please select JPEG or PNG',tooLarge:(mb)=>`File exceeds ${mb}MB`,noLabels:'No results.',errorUnknown:'Unexpected error',rateExceeded:'Daily limit reached. Try again tomorrow.'},
+    de:{title:'Bild-Analyse',pick:'Bild wählen',analyze:'Analysieren',loaded:'Bild geladen.',chooseFirst:'Bitte zuerst ein Bild wählen.',unsupported:'Bitte JPEG oder PNG wählen',tooLarge:(mb)=>`Datei über ${mb}MB`,noLabels:'Keine Ergebnisse.',errorUnknown:'Unerwarteter Fehler',rateExceeded:'Tageslimit erreicht. Versuchen Sie es morgen erneut.'}
+  };
+  const ALLOWED_LANGS=new Set(['ar','en','de']);
+  function safeLang(l){ return ALLOWED_LANGS.has(l)?l:'en'; }
+  function getT(){ return I18N[safeLang(lang)] || I18N.en; }
+
+  const el = {
+    langSwitch:document.getElementById('langSwitch'),
+    title:document.getElementById('title'),
+    pick:document.getElementById('pick'),
+    analyze:document.getElementById('analyze'),
+    file:document.getElementById('file'),
+    img:document.getElementById('img'),
+    msg:document.getElementById('msg'),
+    results:document.getElementById('results'),
+    loader:document.getElementById('loader')
+  };
+
+  const TYPES=['image/jpeg','image/png'];
+  const MAX_MB=10;
+  const MAX_LABELS_RENDER=25;
+
+  function setDirByLang(l){
+    document.body.classList.remove('lang-ar','lang-en','lang-de');
+    document.body.classList.add('lang-'+l);
+    document.documentElement.setAttribute('lang', l);
+    document.documentElement.setAttribute('dir', l==='ar'?'rtl':'ltr');
+  }
+  function setLang(l){
+    lang=safeLang(l);
+    setDirByLang(lang);
+    [...el.langSwitch.querySelectorAll('button')].forEach(b=>b.classList.toggle('active', b.dataset.lang===lang));
+    const t=getT();
+    el.title.textContent=t.title; el.pick.textContent=t.pick; el.analyze.textContent=t.analyze;
+    if(lastParentsOnly.length) retranslateAndRender();
+  }
+
+  function show(ok,text){ el.msg.style.display='block'; el.msg.className='msg '+(ok?'ok':'err'); el.msg.textContent=text; }
+  function busy(b){ el.loader.style.display=b?'inline-block':'none'; el.analyze.disabled=b||!file; }
+  function numberFmt(l){ return new Intl.NumberFormat(safeLang(l)==='ar'?'ar':(safeLang(l)==='de'?'de':'en'), {maximumFractionDigits:2}); }
+
+  el.langSwitch.addEventListener('click',(e)=>{ const btn=e.target.closest('button[data-lang]'); if(!btn) return; setLang(btn.dataset.lang); });
+  el.pick.addEventListener('click',()=> el.file.click());
+  el.file.addEventListener('change', e=>{
+    const t=getT();
+    file=e.target.files[0]; if(!file) return;
+    if(!TYPES.includes(file.type)){ show(false,t.unsupported); file=null; el.img.style.display='none'; el.analyze.disabled=true; return; }
+    if(file.size>MAX_MB*1024*1024){ show(false,t.tooLarge(MAX_MB)); file=null; el.img.style.display='none'; el.analyze.disabled=true; return; }
+    const r=new FileReader();
+    r.onload=ev=>{ el.img.src=ev.target.result; el.img.style.display='block'; el.analyze.disabled=false; show(true,t.loaded); };
+    r.onerror=()=> show(false, t.errorUnknown);
+    r.readAsDataURL(file);
+  });
+
+  async function compressImage(file, maxDim=1280, quality=0.7){
+    const img=await new Promise((res,rej)=>{ const i=new Image(); i.onload=()=>res(i); i.onerror=rej; i.src=URL.createObjectURL(file); });
+    const {width,height}=img; const scale=Math.min(1, maxDim/Math.max(width,height));
+    const w=Math.round(width*scale), h=Math.round(height*scale);
+    const canvas=document.createElement('canvas'); canvas.width=w; canvas.height=h;
+    const ctx=canvas.getContext('2d'); ctx.drawImage(img,0,0,w,h);
+    const mime=file.type==='image/png'?'image/png':'image/jpeg';
+    const dataUrl=canvas.toDataURL(mime, mime==='image/jpeg'?quality:1);
+    URL.revokeObjectURL(img.src);
+    return dataUrl.split(',')[1];
+  }
+
+  function chunk(arr,size){ const out=[]; for(let i=0;i<arr.length;i+=size) out.push(arr.slice(i,i+size)); return out; }
+  async function mapLimit(list,limit,fn){
+    const ret=new Array(list.length); let idx=0;
+    const workers=Array(Math.min(limit,list.length)).fill(0).map(async ()=>{ while(idx<list.length){ const i=idx++; ret[i]=await fn(list[i],i);} });
+    await Promise.all(workers); return ret;
+  }
+  function normalizeName(s){ return String(s||'').trim().toLowerCase(); }
+
+   function extractParentsOnly(labels){
+    const parentMax = new Map();
+    const display   = new Map();
+    const ownConf   = new Map();
+    for(const it of labels){
+      const conf = Number(it?.Confidence || 0);
+      const parents = Array.isArray(it?.Parents) ? it.Parents : [];
+      for(const p of parents){
+        const pname = p?.Name || p?.name || (typeof p==='string'?p:'');
+        if(!pname) continue;
+        const k = normalizeName(pname);
+        display.set(k, pname);
+        parentMax.set(k, Math.max(conf, parentMax.get(k)||0));
+      }
+      const selfName = it?.Name ? normalizeName(it.Name) : null;
+      if(selfName) ownConf.set(selfName, Math.max(conf, ownConf.get(selfName)||0));
+    }
+    const out = [];
+    for(const [k, childMax] of parentMax.entries()){
+      const name = display.get(k) || k;
+      const conf = Math.max(childMax, ownConf.get(k)||0);
+      out.push({ Name: name, Confidence: conf });
+    }
+    out.sort((a,b)=>(b.Confidence||0)-(a.Confidence||0));
+    return out;
+  }
+
+   const wikidataCache=new Map();
+  async function wdSearchOne(term){
+    const url=new URL('https://www.wikidata.org/w/api.php');
+    url.search=new URLSearchParams({action:'wbsearchentities',language:'en',uselang:'en',format:'json',origin:'*',type:'item',limit:'1',search:term}).toString();
+    const res=await fetch(url); if(!res.ok) return {qid:null};
+    const j=await res.json(); return {qid:(j?.search?.[0]?.id)||null};
+  }
+  async function wdGetLabelsBatch(qids,target){
+    if(!qids.length) return {};
+    const reqs=chunk(qids,50).map(async batch=>{
+      const url=new URL('https://www.wikidata.org/w/api.php');
+      url.search=new URLSearchParams({action:'wbgetentities',ids:batch.join('|'),props:'labels',languages:`${target}|en`,format:'json',origin:'*'}).toString();
+      const res=await fetch(url); if(!res.ok) return {};
+      const j=await res.json(); const out={};
+      for(const [qid,ent] of Object.entries(j.entities||{})){
+        out[qid]={ label: ent?.labels?.[target]?.value || ent?.labels?.en?.value || null };
+      }
+      return out;
+    });
+    const parts=await Promise.all(reqs);
+    return Object.assign({},...parts);
+  }
+
+  async function translateLabelsWithWikidata(labels, targetLang){
+    if(!Array.isArray(labels)||!labels.length) return labels||[];
+    const work = labels.slice(0, MAX_LABELS_RENDER);
+    const uniqNames=[...new Set(work.map(it=>String(it.Name||'').trim()).filter(Boolean))];
+    const toResolve=[]; const nameKey=(name)=>`wd:${name}:${targetLang}`;
+    for(const name of uniqNames){ if(!wikidataCache.has(nameKey(name))) toResolve.push(name); }
+    const termToQid={};
+    await mapLimit(toResolve,4, async (name)=>{
+      const {qid}=await wdSearchOne(name);
+      termToQid[name]=qid;
+    });
+    const allQids=Object.values(termToQid).filter(Boolean);
+    const qidToLabel=await wdGetLabelsBatch(allQids, targetLang);
+    for(const name of uniqNames){
+      const qid= termToQid[name] || null;
+      const label = qid ? (qidToLabel[qid]?.label || name) : name;
+      const key = nameKey(name);
+      if(!wikidataCache.has(key)) wikidataCache.set(key, {label,qid});
+    }
+    const enrichedTop = work.map(it=>{
+      const k=nameKey(it.Name);
+      const entry=wikidataCache.get(k) || {label:it.Name, qid:null};
+      return {...it, OriginalName: it.Name, Name: entry.label || it.Name, QID: entry.qid};
+    });
+    const rest = labels.slice(MAX_LABELS_RENDER).map(it=>({...it, OriginalName: it.Name, Name: it.Name, QID: null}));
+    const mapM=new Map();
+    for(const it of [...enrichedTop, ...rest]){
+      const key = it.QID ? `q:${it.QID}` : `n:${normalizeName(it.Name)}`;
+      const prev = mapM.get(key);
+      if(!prev || (Number(it.Confidence||0) > Number(prev.Confidence||0))){
+        mapM.set(key, it);
+      }
+    }
+    return Array.from(mapM.values()).sort((a,b)=>(b.Confidence||0)-(a.Confidence||0));
+  }
+
+  const DISPLAY_NAME = {
+    person:{ ar:'إنسان', en:'Person', de:'Person' },
+    adult:{ ar:'بالغ', en:'Adult', de:'Erwachsene' }
+  };
+  const MERGE_MAP = {
+    ar: new Map([
+      ['إنسان','person'], ['شخص','person'], ['البشر','person'],
+      ['بالغ','adult'], ['راشد','adult']
+    
+    ]),
+    en: new Map([
+      ['person','person'], ['human','person'], ['people','person'], ['adult','adult'],
+      ['female','female'], ['woman','female'], ['male','male'], ['man','male']
+    ]),
+    de: new Map([
+      ['person','person'], ['mensch','person'], ['erwachsene','adult'],
+      ['weiblich','female'], ['frau','female'], ['männlich','male'], ['mann','male']
+      
+
+    ])
+  };
+  function toSlugByLang(name, lang){
+    const norm = String(name||'').trim().toLowerCase();
+    const map = MERGE_MAP[lang] || MERGE_MAP.en;
+    return map.get(norm) || null;
+  }
+  function mergeSimilarLabels(labels, lang){
+    const bySlug = new Map();
+    for(const it of labels){
+      const slug = toSlugByLang(it.Name, lang);
+      if(!slug){
+        const key = `__raw__:${String(it.Name||'').trim().toLowerCase()}`;
+        const prev = bySlug.get(key);
+        if(!prev || Number(it.Confidence||0) > Number(prev.Confidence||0)) bySlug.set(key, it);
+        continue;
+      }
+      const prev = bySlug.get(slug);
+      if(!prev || Number(it.Confidence||0) > Number(prev.Confidence||0)){
+        const display = DISPLAY_NAME[slug]?.[lang] || DISPLAY_NAME[slug]?.en || it.Name;
+        bySlug.set(slug, { ...it, Name: display, Canonical: slug });
+      }
+    }
+    return Array.from(bySlug.values()).sort((a,b)=>(b.Confidence||0)-(a.Confidence||0));
+  }
+  function enforceGenderRule(labels){
+    const femaleIdx = labels.findIndex(x=>x.Canonical==='female' || String(x.Name).toLowerCase()==='female' || String(x.Name).toLowerCase()==='أنثى');
+    const maleIdx   = labels.findIndex(x=>x.Canonical==='male'   || String(x.Name).toLowerCase()==='male'   || String(x.Name).toLowerCase()==='ذكر');
+    if (femaleIdx !== -1 && maleIdx !== -1){
+      const f = labels[femaleIdx], m = labels[maleIdx];
+      const keepFemale = Number(f.Confidence||0) >= Number(m.Confidence||0);
+      const keepIdx = keepFemale ? femaleIdx : maleIdx;
+      return labels.filter((_,i)=> i===keepIdx || (i!==femaleIdx && i!==maleIdx));
+    }
+    return labels;
+  }
+
+  async function retranslateAndRender(){
+    if(!lastParentsOnly.length) return;
+    busy(true);
+    try{
+      const translated=await translateLabelsWithWikidata(lastParentsOnly, lang);
+      let merged=mergeSimilarLabels(translated, lang);
+      merged=enforceGenderRule(merged);
+      renderLabels({labels: merged});
+    } finally { busy(false); }
+  }
+
+  el.analyze.addEventListener('click', async ()=>{
+    const t=getT();
+    if(!file) return show(false, t.chooseFirst);
+    busy(true); el.results.innerHTML='';
+    try{
+      const b64=await compressImage(file, 1280, 0.7);
+      const payload={ content_base64: b64, filename: file.name };
+
+      const resp=await fetch(API_ENDPOINT,{
+        method:'POST',
+        headers:{
+          'content-type':'application/json',
+          'x-client-id': CID,
+          'accept-language': lang
+        },
+        body:JSON.stringify(payload)
+      });
+
+      if (resp.status === 429){
+        let msgObj = {};
+        try { msgObj = await resp.json(); } catch {}
+        const remain = resp.headers.get('x-ratelimit-remaining');
+        show(false, (msgObj.message || t.rateExceeded) + (remain!==null ? ` (المتبقي اليوم: ${remain})` : ''));
+        return;
+      }
+
+      if(!resp.ok){
+        throw new Error(`HTTP ${resp.status}: ${await resp.text()}`);
+      }
+
+      const data=await resp.json();
+
+       lastRawLabels = Array.isArray(data.labels) ? data.labels : [];
+
+       lastParentsOnly = extractParentsOnly(lastRawLabels).slice(0, MAX_SHOW);
+
+       renderLabels({ labels: lastParentsOnly });
+
+       const translated=await translateLabelsWithWikidata(lastParentsOnly, lang);
+      let merged=mergeSimilarLabels(translated, lang);
+      merged=enforceGenderRule(merged);
+      renderLabels({ labels: merged.slice(0, MAX_SHOW) });
+
+    }catch(e){
+      console.error(e);
+      show(false, e.message || getT().errorUnknown);
+    }finally{ busy(false); }
+  });
+
+  function renderLabels(data){
+    el.results.innerHTML='';
+    const t=getT(), nf=numberFmt(lang);
+    const labelsAll = Array.isArray(data?.labels) ? data.labels : [];
+    const labels = labelsAll.slice(0, MAX_SHOW);  
+    if(!labels.length){
+      const p=document.createElement('p'); p.textContent=t.noLabels; el.results.appendChild(p); return;
+    }
+    labels.forEach(item=>{
+      const w=Math.max(0, Math.min(100, Number(item.Confidence||0)));
+      const div=document.createElement('div');
+      div.className='item';
+      div.innerHTML = `
+        <div class="top"><span>${item.Name}</span><span>${nf.format(w)}%</span></div>
+        <div class="bar" style="width:${w}%;"></div>
+      `;
+      el.results.appendChild(div);
+    });
+  }
+
+  setLang('en');
+});
+</script>
+</body>
+</html>
